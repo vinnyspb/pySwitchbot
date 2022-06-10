@@ -1,13 +1,17 @@
 """Library to handle connection with Switchbot."""
 from __future__ import annotations
 
+import asyncio
 import binascii
 import logging
+import uuid
 from threading import Lock
 import time
 from typing import Any
 
-import bluepy
+from bleak import BleakScanner, BleakError
+from bleak.backends.corebluetooth.client import BleakClientCoreBluetooth
+from bleak.backends.device import BLEDevice
 
 DEFAULT_RETRY_COUNT = 3
 DEFAULT_RETRY_TIMEOUT = 1
@@ -41,15 +45,15 @@ _LOGGER = logging.getLogger(__name__)
 CONNECT_LOCK = Lock()
 
 
-def _sb_uuid(comms_type: str = "service") -> bluepy.btle.UUID:
+def _sb_uuid(comms_type: str = "service") -> uuid.UUID:
     """Return Switchbot UUID."""
 
     _uuid = {"tx": "002", "rx": "003", "service": "d00"}
 
     if comms_type in _uuid:
-        return bluepy.btle.UUID(f"cba20{_uuid[comms_type]}-224d-11e6-9fb8-0002a5d5c51b")
+        return uuid.UUID(f"cba20{_uuid[comms_type]}-224d-11e6-9fb8-0002a5d5c51b")
 
-    return "Incorrect type, choose between: tx, rx or service"
+    raise BleakError("Incorrect type, choose between: tx, rx or service")
 
 
 def _process_wohand(data: bytes) -> dict[str, bool | int]:
@@ -65,50 +69,13 @@ def _process_wohand(data: bytes) -> dict[str, bool | int]:
     return _bot_data
 
 
-def _process_wocurtain(data: bytes, reverse: bool = True) -> dict[str, bool | int]:
-    """Process woCurtain/Curtain services data."""
-
-    _position = max(min(data[3] & 0b01111111, 100), 0)
-
-    _curtain_data = {
-        "calibration": bool(data[1] & 0b01000000),
-        "battery": data[2] & 0b01111111,
-        "inMotion": bool(data[3] & 0b10000000),
-        "position": (100 - _position) if reverse else _position,
-        "lightLevel": (data[4] >> 4) & 0b00001111,
-        "deviceChain": data[4] & 0b00000111,
-    }
-
-    return _curtain_data
-
-
-def _process_wosensorth(data: bytes) -> dict[str, object]:
-    """Process woSensorTH/Temp sensor services data."""
-
-    _temp_sign = 1 if data[4] & 0b10000000 else -1
-    _temp_c = _temp_sign * ((data[4] & 0b01111111) + (data[3] / 10))
-    _temp_f = (_temp_c * 9 / 5) + 32
-    _temp_f = (_temp_f * 10) / 10
-
-    _wosensorth_data = {
-        "temp": {"c": _temp_c, "f": _temp_f},
-        "fahrenheit": bool(data[5] & 0b10000000),
-        "humidity": data[5] & 0b01111111,
-        "battery": data[2] & 0b01111111,
-    }
-
-    return _wosensorth_data
-
-
-def _process_btle_adv_data(dev: bluepy.btle.ScanEntry) -> dict[str, Any]:
+def _process_btle_adv_data(dev: BLEDevice) -> dict[str, Any]:
     """Process bt le adv data."""
-    _adv_data = {"mac_address": dev.addr}
-    _data = dev.getValue(22)[2:]
+    _adv_data = {"mac_address": dev.address}
+    _data = list(dev.metadata['service_data'].values())[0]
 
     supported_types: dict[str, dict[str, Any]] = {
         "H": {"modelName": "WoHand", "func": _process_wohand},
-        "c": {"modelName": "WoCurtain", "func": _process_wocurtain},
-        "T": {"modelName": "WoSensorTH", "func": _process_wosensorth},
     }
 
     _model = chr(_data[0] & 0b01111111)
@@ -119,7 +86,7 @@ def _process_btle_adv_data(dev: bluepy.btle.ScanEntry) -> dict[str, Any]:
         _adv_data["data"]["rssi"] = dev.rssi
         _adv_data["modelName"] = supported_types[_model]["modelName"]
     else:
-        _adv_data["rawAdvData"] = dev.getValueText(22)
+        _adv_data["rawAdvData"] = list(dev.metadata['service_data'].values())[0]
 
     return _adv_data
 
@@ -132,7 +99,7 @@ class GetSwitchbotDevices:
         self._interface = interface
         self._adv_data: dict[str, Any] = {}
 
-    def discover(
+    async def discover(
         self,
         retry: int = DEFAULT_RETRY_COUNT,
         scan_timeout: int = DEFAULT_SCAN_TIMEOUT,
@@ -144,10 +111,10 @@ class GetSwitchbotDevices:
 
         with CONNECT_LOCK:
             try:
-                devices = bluepy.btle.Scanner(self._interface).scan(
-                    scan_timeout, passive
+                devices = await BleakScanner().discover(
+                    scan_timeout
                 )
-            except bluepy.btle.BTLEManagementError:
+            except BleakError:
                 _LOGGER.error("Error scanning for switchbot devices", exc_info=True)
 
         if devices is None:
@@ -162,7 +129,7 @@ class GetSwitchbotDevices:
                 retry,
             )
             time.sleep(DEFAULT_RETRY_TIMEOUT)
-            return self.discover(
+            return await self.discover(
                 retry=retry - 1,
                 scan_timeout=scan_timeout,
                 passive=passive,
@@ -170,33 +137,19 @@ class GetSwitchbotDevices:
             )
 
         for dev in devices:
-            if dev.getValueText(7) == str(_sb_uuid()):
-                dev_id = dev.addr.replace(":", "")
+            if str(_sb_uuid()) in dev.metadata['uuids']:
                 if mac:
-                    if dev.addr.lower() == mac.lower():
-                        self._adv_data[dev_id] = _process_btle_adv_data(dev)
+                    if dev.address.lower() == mac.lower():
+                        self._adv_data[dev.address] = _process_btle_adv_data(dev)
                 else:
-                    self._adv_data[dev_id] = _process_btle_adv_data(dev)
+                    self._adv_data[dev.address] = _process_btle_adv_data(dev)
 
         return self._adv_data
 
-    def get_curtains(self) -> dict:
-        """Return all WoCurtain/Curtains devices with services data."""
-        if not self._adv_data:
-            self.discover()
-
-        _curtain_devices = {
-            device: data
-            for device, data in self._adv_data.items()
-            if data.get("model") == "c"
-        }
-
-        return _curtain_devices
-
-    def get_bots(self) -> dict:
+    async def get_bots(self) -> dict:
         """Return all WoHand/Bot devices with services data."""
         if not self._adv_data:
-            self.discover()
+            await self.discover()
 
         _bot_devices = {
             device: data
@@ -206,23 +159,10 @@ class GetSwitchbotDevices:
 
         return _bot_devices
 
-    def get_tempsensors(self) -> dict:
-        """Return all WoSensorTH/Temp sensor devices with services data."""
-        if not self._adv_data:
-            self.discover()
-
-        _bot_temp = {
-            device: data
-            for device, data in self._adv_data.items()
-            if data.get("model") == "T"
-        }
-
-        return _bot_temp
-
-    def get_device_data(self, mac: str) -> dict:
+    async def get_device_data(self, mac: str) -> dict:
         """Return data for specific device."""
         if not self._adv_data:
-            self.discover()
+            await self.discover()
 
         _switchbot_data = {
             device: data
@@ -233,7 +173,7 @@ class GetSwitchbotDevices:
         return _switchbot_data
 
 
-class SwitchbotDevice(bluepy.btle.Peripheral):
+class SwitchbotDevice(BleakClientCoreBluetooth):
     """Base Representation of a Switchbot Device."""
 
     def __init__(
@@ -244,17 +184,16 @@ class SwitchbotDevice(bluepy.btle.Peripheral):
         **kwargs: Any,
     ) -> None:
         """Switchbot base class constructor."""
-        bluepy.btle.Peripheral.__init__(
+        BleakClientCoreBluetooth.__init__(
             self,
-            deviceAddr=None,
-            addrType=bluepy.btle.ADDR_TYPE_RANDOM,
-            iface=interface,
+            address_or_ble_device=mac,
         )
         self._interface = interface
-        self._mac = mac.replace("-", ":").lower()
+        self._mac = mac
         self._sb_adv_data: dict[str, Any] = {}
         self._scan_timeout: int = kwargs.pop("scan_timeout", DEFAULT_SCAN_TIMEOUT)
         self._retry_count: int = kwargs.pop("retry_count", DEFAULT_RETRY_COUNT)
+        self._notifications = []
         if password is None or password == "":
             self._password_encoded = None
         else:
@@ -262,72 +201,26 @@ class SwitchbotDevice(bluepy.btle.Peripheral):
                 binascii.crc32(password.encode("ascii")) & 0xFFFFFFFF
             )
 
+    async def pair(self, *args, **kwargs) -> bool:
+        raise NotImplementedError
+
+    async def unpair(self) -> bool:
+        raise NotImplementedError
+
     # pylint: disable=arguments-differ
-    def _connect(self, retry: int, timeout: int | None = None) -> None:
+    async def _connect(self, retry: int) -> None:
         _LOGGER.debug("Connecting to Switchbot")
 
         if retry < 1:  # failsafe
-            self._stopHelper()
-            raise bluepy.btle.BTLEDisconnectError(
+            await self.disconnect()
+            raise BleakError(
                 "Failed to connect to peripheral %s" % self._mac
             )
 
-        if self._helper is None:
-            self._startHelper(self._interface)
-
-        self._writeCmd("conn %s %s\n" % (self._mac, bluepy.btle.ADDR_TYPE_RANDOM))
-
-        rsp = self._getResp(["stat", "err"], timeout)
-
-        while rsp and rsp["state"][0] in [
-            "tryconn",
-            "scan",
-        ]:  # Wait for any operations to finish.
-            rsp = self._getResp(["stat", "err"], timeout)
-
-        # If operation in progress, disc is returned.
-        # Bluepy helper can't handle state. Execute stop, wait and retry.
-        if rsp and rsp["state"][0] == "disc":
-            _LOGGER.warning("Bluepy busy, waiting before retry")
-            self._stopHelper()
-            time.sleep(self._scan_timeout)
-            return self._connect(retry - 1, timeout)
-
-        if rsp and rsp["rsp"][0] == "err":
-            errcode = rsp["code"][0]
-            _LOGGER.debug(
-                "Error trying to connect to peripheral %s, error: %s",
-                self._mac,
-                errcode,
-            )
-
-            if errcode == "connfail":  # not terminal, can retry connection.
-                return self._connect(retry - 1, timeout)
-
-            if errcode == "nomgmt":
-                raise bluepy.btle.BTLEManagementError(
-                    "Management not available (permissions problem?)", rsp
-                )
-            if errcode == "atterr":
-                raise bluepy.btle.BTLEGattError("Bluetooth command failed", rsp)
-
-            raise bluepy.btle.BTLEException(
-                "Error from bluepy-helper (%s)" % errcode, rsp
-            )
-
-        if rsp is None or rsp["state"][0] != "conn":
-            self._stopHelper()
-
-            if rsp is None:
-                _LOGGER.warning(
-                    "Timed out while trying to connect to peripheral %s", self._mac
-                )
-
-            _LOGGER.warning("Bluehelper returned unable to connect state: %s", rsp)
-
-            raise bluepy.btle.BTLEDisconnectError(
-                "Failed to connect to peripheral %s, rsp: %s" % (self._mac, rsp)
-            )
+        if not await self.connect():
+            raise BleakError(
+                        "Connection failed"
+                    )
 
     def _commandkey(self, key: str) -> str:
         if self._password_encoded is None:
@@ -336,15 +229,13 @@ class SwitchbotDevice(bluepy.btle.Peripheral):
         key_suffix = key[4:]
         return KEY_PASSWORD_PREFIX + key_action + self._password_encoded + key_suffix
 
-    def _writekey(self, key: str) -> bool:
+    async def _writekey(self, key: str) -> bool:
         _LOGGER.debug("Prepare to send")
-        if self._helper is None or self.getState() == "disc":
-            return False
         try:
-            hand = self.getCharacteristics(uuid=_sb_uuid("tx"))[0]
+            # hand = await self.read_gatt_char(_sb_uuid("tx"))
             _LOGGER.debug("Sending command, %s", key)
-            hand.write(bytes.fromhex(key), withResponse=False)
-        except bluepy.btle.BTLEException:
+            await self.write_gatt_char(_sb_uuid("tx"), bytes.fromhex(key))
+        except BleakError:
             _LOGGER.warning("Error sending command to Switchbot", exc_info=True)
             raise
         else:
@@ -352,18 +243,15 @@ class SwitchbotDevice(bluepy.btle.Peripheral):
 
         return True
 
-    def _subscribe(self) -> bool:
+    def _on_notify(self, sender: int, data: bytearray):
+        print(f"{sender}: {data}")
+        self._notifications.append(data)
+
+    async def _subscribe(self) -> bool:
         _LOGGER.debug("Subscribe to notifications")
-        if self._helper is None or self.getState() == "disc":
-            return False
-        enable_notify_flag = b"\x01\x00"  # standard gatt flag to enable notification
         try:
-            handle = self.getCharacteristics(uuid=_sb_uuid("rx"))[0]
-            notify_handle = handle.getHandle() + 1
-            self.writeCharacteristic(
-                notify_handle, enable_notify_flag, withResponse=False
-            )
-        except bluepy.btle.BTLEException:
+            await self.start_notify(_sb_uuid("rx"), self._on_notify)
+        except BleakError:
             _LOGGER.warning(
                 "Error while enabling notifications on Switchbot", exc_info=True
             )
@@ -371,53 +259,36 @@ class SwitchbotDevice(bluepy.btle.Peripheral):
 
         return True
 
-    def _readkey(self) -> bytes:
+    async def _readkey(self) -> bytes:
         _LOGGER.debug("Prepare to read notification from switchbot")
-        if self._helper is None:
-            return b"\x00"
-        try:
-            receive_handle = self.getCharacteristics(uuid=_sb_uuid("rx"))
-        except bluepy.btle.BTLEException:
-            _LOGGER.warning(
-                "Error while reading notifications from Switchbot", exc_info=True
-            )
-        else:
-            for char in receive_handle:
-                read_result: bytes = char.read()
-            return read_result
+        while len(self._notifications) == 0:
+            await asyncio.sleep(0.1)
 
-        # Could disconnect before reading response. Assume it worked as this is executed after issueing command.
-        if self._helper and self.getState() == "disc":
-            return b"\x01"
+        return self._notifications.pop()
 
-        return b"\x00"
-
-    def _sendcommand(self, key: str, retry: int, timeout: int | None = 40) -> bytes:
+    async def _sendcommand(self, key: str, retry: int) -> bytes:
         command = self._commandkey(key)
         send_success = False
         notify_msg = None
         _LOGGER.debug("Sending command to switchbot %s", command)
 
-        if len(self._mac.split(":")) != 6:
-            raise ValueError("Expected MAC address, got %s" % repr(self._mac))
-
         with CONNECT_LOCK:
             try:
-                self._connect(retry, timeout)
-                send_success = self._subscribe()
-            except bluepy.btle.BTLEException:
+                await self._connect(retry)
+                send_success = await self._subscribe()
+            except BleakError:
                 _LOGGER.warning("Error connecting to Switchbot", exc_info=True)
             else:
                 try:
-                    send_success = self._writekey(command)
-                except bluepy.btle.BTLEException:
+                    send_success = await self._writekey(command)
+                except BleakError:
                     _LOGGER.warning(
                         "Error sending commands to Switchbot", exc_info=True
                     )
                 else:
-                    notify_msg = self._readkey()
+                    notify_msg = await self._readkey()
             finally:
-                self.disconnect()
+                await self.disconnect()
 
         if notify_msg and send_success:
             if notify_msg == b"\x07":
@@ -433,7 +304,7 @@ class SwitchbotDevice(bluepy.btle.Peripheral):
             return b"\x00"
         _LOGGER.warning("Cannot connect to Switchbot. Retrying (remaining: %d)", retry)
         time.sleep(DEFAULT_RETRY_TIMEOUT)
-        return self._sendcommand(key, retry - 1)
+        return await self._sendcommand(key, retry - 1)
 
     def get_mac(self) -> str:
         """Return mac address of device."""
@@ -445,7 +316,7 @@ class SwitchbotDevice(bluepy.btle.Peripheral):
             return None
         return self._sb_adv_data["data"].get("battery")
 
-    def get_device_data(
+    async def get_device_data(
         self,
         retry: int = DEFAULT_RETRY_COUNT,
         interface: int | None = None,
@@ -454,17 +325,15 @@ class SwitchbotDevice(bluepy.btle.Peripheral):
         """Find switchbot devices and their advertisement data."""
         _interface: int = interface if interface else self._interface
 
-        dev_id = self._mac.replace(":", "")
-
-        _data = GetSwitchbotDevices(interface=_interface).discover(
+        _data = await GetSwitchbotDevices(interface=_interface).discover(
             retry=retry,
             scan_timeout=self._scan_timeout,
             passive=passive,
             mac=self._mac,
         )
 
-        if _data.get(dev_id):
-            self._sb_adv_data = _data[dev_id]
+        if _data.get(self._mac):
+            self._sb_adv_data = _data[self._mac]
 
         return self._sb_adv_data
 
@@ -478,15 +347,21 @@ class Switchbot(SwitchbotDevice):
         self._inverse: bool = kwargs.pop("inverse_mode", False)
         self._settings: dict[str, Any] = {}
 
-    def update(self, interface: int | None = None, passive: bool = False) -> None:
+    async def pair(self, *args, **kwargs) -> bool:
+        raise NotImplementedError
+
+    async def unpair(self) -> bool:
+        raise NotImplementedError
+
+    async def update(self, interface: int | None = None, passive: bool = False) -> None:
         """Update mode, battery percent and state of device."""
-        self.get_device_data(
+        await self.get_device_data(
             retry=self._retry_count, interface=interface, passive=passive
         )
 
-    def turn_on(self) -> bool:
+    async def turn_on(self) -> bool:
         """Turn device on."""
-        result = self._sendcommand(ON_KEY, self._retry_count)
+        result = await self._sendcommand(ON_KEY, self._retry_count)
 
         if result[0] == 1:
             return True
@@ -497,9 +372,9 @@ class Switchbot(SwitchbotDevice):
 
         return False
 
-    def turn_off(self) -> bool:
+    async def turn_off(self) -> bool:
         """Turn device off."""
-        result = self._sendcommand(OFF_KEY, self._retry_count)
+        result = await self._sendcommand(OFF_KEY, self._retry_count)
         if result[0] == 1:
             return True
 
@@ -509,9 +384,9 @@ class Switchbot(SwitchbotDevice):
 
         return False
 
-    def hand_up(self) -> bool:
+    async def hand_up(self) -> bool:
         """Raise device arm."""
-        result = self._sendcommand(UP_KEY, self._retry_count)
+        result = await self._sendcommand(UP_KEY, self._retry_count)
         if result[0] == 1:
             return True
 
@@ -521,9 +396,9 @@ class Switchbot(SwitchbotDevice):
 
         return False
 
-    def hand_down(self) -> bool:
+    async def hand_down(self) -> bool:
         """Lower device arm."""
-        result = self._sendcommand(DOWN_KEY, self._retry_count)
+        result = await self._sendcommand(DOWN_KEY, self._retry_count)
         if result[0] == 1:
             return True
 
@@ -533,9 +408,9 @@ class Switchbot(SwitchbotDevice):
 
         return False
 
-    def press(self) -> bool:
+    async def press(self) -> bool:
         """Press command to device."""
-        result = self._sendcommand(PRESS_KEY, self._retry_count)
+        result = await self._sendcommand(PRESS_KEY, self._retry_count)
         if result[0] == 1:
             return True
 
@@ -545,14 +420,14 @@ class Switchbot(SwitchbotDevice):
 
         return False
 
-    def set_switch_mode(
+    async def set_switch_mode(
         self, switch_mode: bool = False, strength: int = 100, inverse: bool = False
     ) -> bool:
         """Change bot mode."""
         mode_key = format(switch_mode, "b") + format(inverse, "b")
-        strength_key = f"{strength:0{2}x}"  # to hex with padding to double digit
+        strength_key = f"{strength:0{2}x}"  # to hex with padding to double-digit
 
-        result = self._sendcommand(
+        result = await self._sendcommand(
             DEVICE_SET_MODE_KEY + strength_key + mode_key, self._retry_count
         )
 
@@ -561,11 +436,11 @@ class Switchbot(SwitchbotDevice):
 
         return False
 
-    def set_long_press(self, duration: int = 0) -> bool:
+    async def set_long_press(self, duration: int = 0) -> bool:
         """Set bot long press duration."""
-        duration_key = f"{duration:0{2}x}"  # to hex with padding to double digit
+        duration_key = f"{duration:0{2}x}"  # to hex with padding to double-digit
 
-        result = self._sendcommand(
+        result = await self._sendcommand(
             DEVICE_SET_EXTENDED_KEY + "08" + duration_key, self._retry_count
         )
 
@@ -574,14 +449,14 @@ class Switchbot(SwitchbotDevice):
 
         return False
 
-    def get_basic_info(self) -> dict[str, Any] | None:
+    async def get_basic_info(self) -> dict[str, Any] | None:
         """Get device basic settings."""
-        _data = self._sendcommand(
+        _data = await self._sendcommand(
             key=DEVICE_GET_BASIC_SETTINGS_KEY, retry=self._retry_count
         )
 
         if _data in (b"\x07", b"\x00"):
-            _LOGGER.error("Unsuccessfull, please try again")
+            _LOGGER.error("Unsuccessful, please try again")
             return None
 
         self._settings = {
@@ -613,183 +488,3 @@ class Switchbot(SwitchbotDevice):
             return not self._sb_adv_data["data"].get("isOn")
 
         return self._sb_adv_data["data"].get("isOn")
-
-
-class SwitchbotCurtain(SwitchbotDevice):
-    """Representation of a Switchbot Curtain."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Switchbot Curtain/WoCurtain constructor."""
-
-        # The position of the curtain is saved returned with 0 = open and 100 = closed.
-        # This is independent of the calibration of the curtain bot (Open left to right/
-        # Open right to left/Open from the middle).
-        # The parameter 'reverse_mode' reverse these values,
-        # if 'reverse_mode' = True, position = 0 equals close
-        # and position = 100 equals open. The parameter is default set to True so that
-        # the definition of position is the same as in Home Assistant.
-
-        super().__init__(*args, **kwargs)
-        self._reverse: bool = kwargs.pop("reverse_mode", True)
-        self._settings: dict[str, Any] = {}
-        self.ext_info_sum: dict[str, Any] = {}
-        self.ext_info_adv: dict[str, Any] = {}
-
-    def open(self) -> bool:
-        """Send open command."""
-        result = self._sendcommand(OPEN_KEY, self._retry_count)
-        if result[0] == 1:
-            return True
-
-        return False
-
-    def close(self) -> bool:
-        """Send close command."""
-        result = self._sendcommand(CLOSE_KEY, self._retry_count)
-        if result[0] == 1:
-            return True
-
-        return False
-
-    def stop(self) -> bool:
-        """Send stop command to device."""
-        result = self._sendcommand(STOP_KEY, self._retry_count)
-        if result[0] == 1:
-            return True
-
-        return False
-
-    def set_position(self, position: int) -> bool:
-        """Send position command (0-100) to device."""
-        position = (100 - position) if self._reverse else position
-        hex_position = "%0.2X" % position
-        result = self._sendcommand(POSITION_KEY + hex_position, self._retry_count)
-        if result[0] == 1:
-            return True
-
-        return False
-
-    def update(self, interface: int | None = None, passive: bool = False) -> None:
-        """Update position, battery percent and light level of device."""
-        self.get_device_data(
-            retry=self._retry_count, interface=interface, passive=passive
-        )
-
-    def get_position(self) -> Any:
-        """Return cached position (0-100) of Curtain."""
-        # To get actual position call update() first.
-        if not self._sb_adv_data.get("data"):
-            return None
-        return self._sb_adv_data["data"].get("position")
-
-    def get_basic_info(self) -> dict[str, Any] | None:
-        """Get device basic settings."""
-        _data = self._sendcommand(
-            key=DEVICE_GET_BASIC_SETTINGS_KEY, retry=self._retry_count
-        )
-
-        if _data in (b"\x07", b"\x00"):
-            _LOGGER.error("Unsuccessfull, please try again")
-            return None
-
-        _position = max(min(_data[6], 100), 0)
-
-        self._settings = {
-            "battery": _data[1],
-            "firmware": _data[2] / 10.0,
-            "chainLength": _data[3],
-            "openDirection": (
-                "right_to_left" if _data[4] & 0b10000000 == 128 else "left_to_right"
-            ),
-            "touchToOpen": bool(_data[4] & 0b01000000),
-            "light": bool(_data[4] & 0b00100000),
-            "fault": bool(_data[4] & 0b00001000),
-            "solarPanel": bool(_data[5] & 0b00001000),
-            "calibrated": bool(_data[5] & 0b00000100),
-            "inMotion": bool(_data[5] & 0b01000011),
-            "position": (100 - _position) if self._reverse else _position,
-            "timers": _data[7],
-        }
-
-        return self._settings
-
-    def get_extended_info_summary(self) -> dict[str, Any] | None:
-        """Get basic info for all devices in chain."""
-        _data = self._sendcommand(key=CURTAIN_EXT_SUM_KEY, retry=self._retry_count)
-
-        if _data in (b"\x07", b"\x00"):
-            _LOGGER.error("Unsuccessfull, please try again")
-            return None
-
-        self.ext_info_sum["device0"] = {
-            "openDirectionDefault": not bool(_data[1] & 0b10000000),
-            "touchToOpen": bool(_data[1] & 0b01000000),
-            "light": bool(_data[1] & 0b00100000),
-            "openDirection": (
-                "left_to_right" if _data[1] & 0b00010000 == 1 else "right_to_left"
-            ),
-        }
-
-        # if grouped curtain device present.
-        if _data[2] != 0:
-            self.ext_info_sum["device1"] = {
-                "openDirectionDefault": not bool(_data[1] & 0b10000000),
-                "touchToOpen": bool(_data[1] & 0b01000000),
-                "light": bool(_data[1] & 0b00100000),
-                "openDirection": (
-                    "left_to_right" if _data[1] & 0b00010000 else "right_to_left"
-                ),
-            }
-
-        return self.ext_info_sum
-
-    def get_extended_info_adv(self) -> dict[str, Any] | None:
-        """Get advance page info for device chain."""
-        _data = self._sendcommand(key=CURTAIN_EXT_ADV_KEY, retry=self._retry_count)
-
-        if _data in (b"\x07", b"\x00"):
-            _LOGGER.error("Unsuccessfull, please try again")
-            return None
-
-        _state_of_charge = [
-            "not_charging",
-            "charging_by_adapter",
-            "charging_by_solar",
-            "fully_charged",
-            "solar_not_charging",
-            "charging_error",
-        ]
-
-        self.ext_info_adv["device0"] = {
-            "battery": _data[1],
-            "firmware": _data[2] / 10.0,
-            "stateOfCharge": _state_of_charge[_data[3]],
-        }
-
-        # If grouped curtain device present.
-        if _data[4]:
-            self.ext_info_adv["device1"] = {
-                "battery": _data[4],
-                "firmware": _data[5] / 10.0,
-                "stateOfCharge": _state_of_charge[_data[6]],
-            }
-
-        return self.ext_info_adv
-
-    def get_light_level(self) -> Any:
-        """Return cached light level."""
-        # To get actual light level call update() first.
-        if not self._sb_adv_data.get("data"):
-            return None
-        return self._sb_adv_data["data"].get("lightLevel")
-
-    def is_reversed(self) -> bool:
-        """Return True if curtain position is opposite from SB data."""
-        return self._reverse
-
-    def is_calibrated(self) -> Any:
-        """Return True curtain is calibrated."""
-        # To get actual light level call update() first.
-        if not self._sb_adv_data.get("data"):
-            return None
-        return self._sb_adv_data["data"].get("calibration")

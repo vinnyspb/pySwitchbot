@@ -1,4 +1,6 @@
-# pySwitchbot [![Build Status](https://travis-ci.org/Danielhiversen/pySwitchbot.svg?branch=master)](https://travis-ci.org/Danielhiversen/pySwitchbot)
-Library to control Switchbot IoT devices https://www.switch-bot.com/bot
+# pySwitchbot (macOS-compatible)
 
-[Buy me a coffee :)](http://paypal.me/dahoiv)
+Fork of https://github.com/Danielhiversen/pySwitchbot
+
+This is a simplified version with the only goal is to be able to run on macOS,
+hence [bluepy](https://github.com/IanHarvey/bluepy) dependency is replaced with [bleak](https://bleak.readthedocs.io/).

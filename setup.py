@@ -3,7 +3,7 @@ from setuptools import setup
 setup(
     name = 'PySwitchbot',
     packages = ['switchbot'],
-    install_requires=['bluepy'],
+    install_requires=['bleak'],
     version = '0.13.3',
     description = 'A library to communicate with Switchbot',
     author='Daniel Hjelseth Hoyer',
